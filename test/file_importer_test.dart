@@ -51,7 +51,7 @@ void main() {
           process,
           errorId,
           "Request ID ${request.id} doesn't match response type "
-          "InboundMessage_CanonicalizeResponse.");
+          "InboundMessage_Message.canonicalizeResponse.");
       await process.kill();
     });
   });

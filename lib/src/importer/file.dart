@@ -32,31 +32,28 @@ class FileImporter extends ImporterBase {
   Uri? canonicalize(Uri url) {
     if (url.scheme == 'file') return _filesystemImporter.canonicalize(url);
 
-    // ignore: deprecated_member_use
-    return waitFor(() async {
-      var response = await dispatcher
-          .sendFileImportRequest(OutboundMessage_FileImportRequest()
-            ..compilationId = _compilationId
-            ..importerId = _importerId
-            ..url = url.toString()
-            ..fromImport = fromImport);
+    var response =
+        dispatcher.sendFileImportRequest(OutboundMessage_FileImportRequest()
+          ..compilationId = _compilationId
+          ..importerId = _importerId
+          ..url = url.toString()
+          ..fromImport = fromImport);
 
-      switch (response.whichResult()) {
-        case InboundMessage_FileImportResponse_Result.fileUrl:
-          var url = parseAbsoluteUrl("The file importer", response.fileUrl);
-          if (url.scheme != 'file') {
-            throw 'The file importer must return a file: URL, was "$url"';
-          }
+    switch (response.whichResult()) {
+      case InboundMessage_FileImportResponse_Result.fileUrl:
+        var url = parseAbsoluteUrl("The file importer", response.fileUrl);
+        if (url.scheme != 'file') {
+          throw 'The file importer must return a file: URL, was "$url"';
+        }
 
-          return _filesystemImporter.canonicalize(url);
+        return _filesystemImporter.canonicalize(url);
 
-        case InboundMessage_FileImportResponse_Result.error:
-          throw response.error;
+      case InboundMessage_FileImportResponse_Result.error:
+        throw response.error;
 
-        case InboundMessage_FileImportResponse_Result.notSet:
-          return null;
-      }
-    }());
+      case InboundMessage_FileImportResponse_Result.notSet:
+        return null;
+    }
   }
 
   sass.ImporterResult? load(Uri url) => _filesystemImporter.load(url);

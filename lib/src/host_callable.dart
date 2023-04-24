@@ -39,8 +39,7 @@ sass.Callable hostCallable(Dispatcher dispatcher, FunctionRegistry functions,
       request.name = callable.name;
     }
 
-    // ignore: deprecated_member_use
-    var response = waitFor(dispatcher.sendFunctionCallRequest(request));
+    var response = dispatcher.sendFunctionCallRequest(request);
     try {
       switch (response.whichResult()) {
         case InboundMessage_FunctionCallResponse_Result.success:

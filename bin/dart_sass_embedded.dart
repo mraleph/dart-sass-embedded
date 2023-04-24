@@ -22,7 +22,7 @@ import 'package:sass_embedded/src/utils.dart';
 void main(List<String> args) {
   if (args.isNotEmpty) {
     if (args.first == "--version") {
-      var response = Dispatcher.versionResponse();
+      var response = MainDispatcher.versionResponse();
       response.id = 0;
       stdout.writeln(
           JsonEncoder.withIndent("  ").convert(response.toProto3Json()));
@@ -37,11 +37,11 @@ void main(List<String> args) {
     return;
   }
 
-  var dispatcher = Dispatcher(
+  var dispatcher = MainDispatcher(
       StreamChannel.withGuarantees(stdin, stdout, allowSinkErrors: false)
           .transform(lengthDelimited));
 
-  dispatcher.listen((request) async {
+  dispatcher.listen((dispatcher, request) async {
     var functions = FunctionRegistry();
 
     var style = request.style == OutputStyle.COMPRESSED

@@ -50,7 +50,7 @@ void main() {
           process,
           errorId,
           "Request ID ${request.id} doesn't match response type "
-          "InboundMessage_ImportResponse.");
+          "InboundMessage_Message.importResponse.");
       await process.kill();
     });
 

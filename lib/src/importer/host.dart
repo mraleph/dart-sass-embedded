@@ -24,53 +24,46 @@ class HostImporter extends ImporterBase {
       : super(dispatcher);
 
   Uri? canonicalize(Uri url) {
-    // ignore: deprecated_member_use
-    return waitFor(() async {
-      var response = await dispatcher
-          .sendCanonicalizeRequest(OutboundMessage_CanonicalizeRequest()
-            ..compilationId = _compilationId
-            ..importerId = _importerId
-            ..url = url.toString()
-            ..fromImport = fromImport);
+    var response =
+        dispatcher.sendCanonicalizeRequest(OutboundMessage_CanonicalizeRequest()
+          ..compilationId = _compilationId
+          ..importerId = _importerId
+          ..url = url.toString()
+          ..fromImport = fromImport);
 
-      switch (response.whichResult()) {
-        case InboundMessage_CanonicalizeResponse_Result.url:
-          return parseAbsoluteUrl("The importer", response.url);
+    switch (response.whichResult()) {
+      case InboundMessage_CanonicalizeResponse_Result.url:
+        return parseAbsoluteUrl("The importer", response.url);
 
-        case InboundMessage_CanonicalizeResponse_Result.error:
-          throw response.error;
+      case InboundMessage_CanonicalizeResponse_Result.error:
+        throw response.error;
 
-        case InboundMessage_CanonicalizeResponse_Result.notSet:
-          return null;
-      }
-    }());
+      case InboundMessage_CanonicalizeResponse_Result.notSet:
+        return null;
+    }
   }
 
   sass.ImporterResult? load(Uri url) {
-    // ignore: deprecated_member_use
-    return waitFor(() async {
-      var response =
-          await dispatcher.sendImportRequest(OutboundMessage_ImportRequest()
-            ..compilationId = _compilationId
-            ..importerId = _importerId
-            ..url = url.toString());
+    var response = dispatcher.sendImportRequest(OutboundMessage_ImportRequest()
+      ..compilationId = _compilationId
+      ..importerId = _importerId
+      ..url = url.toString());
 
-      switch (response.whichResult()) {
-        case InboundMessage_ImportResponse_Result.success:
-          return sass.ImporterResult(response.success.contents,
-              sourceMapUrl: response.success.sourceMapUrl.isEmpty
-                  ? null
-                  : parseAbsoluteUrl(
-                      "The importer", response.success.sourceMapUrl),
-              syntax: syntaxToSyntax(response.success.syntax));
+    switch (response.whichResult()) {
+      case InboundMessage_ImportResponse_Result.success:
+        return sass.ImporterResult(response.success.contents,
+            sourceMapUrl: response.success.sourceMapUrl.isEmpty
+                ? null
+                : parseAbsoluteUrl(
+                    "The importer", response.success.sourceMapUrl),
+            syntax: syntaxToSyntax(response.success.syntax));
 
-        case InboundMessage_ImportResponse_Result.error:
-          throw response.error;
+      case InboundMessage_ImportResponse_Result.error:
+        throw response.error;
 
-        case InboundMessage_ImportResponse_Result.notSet:
-          return null;
-      }
-    }());
+      case InboundMessage_ImportResponse_Result.notSet:
+        return null;
+    }
   }
 
   String toString() => "HostImporter";

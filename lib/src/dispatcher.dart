@@ -3,7 +3,9 @@
 // https://opensource.org/licenses/MIT.
 
 import 'dart:async';
+import 'dart:ffi';
 import 'dart:io';
+import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'package:protobuf/protobuf.dart';
@@ -12,9 +14,22 @@ import 'package:stream_channel/stream_channel.dart';
 
 import 'embedded_sass.pb.dart';
 import 'utils.dart';
+import 'mailbox.dart';
+
+const _responseTypeFor = <OutboundMessage_Message, InboundMessage_Message>{
+  OutboundMessage_Message.canonicalizeRequest:
+      InboundMessage_Message.canonicalizeResponse,
+  OutboundMessage_Message.importRequest: InboundMessage_Message.importResponse,
+  OutboundMessage_Message.fileImportRequest:
+      InboundMessage_Message.fileImportResponse,
+  OutboundMessage_Message.functionCallRequest:
+      InboundMessage_Message.functionCallResponse,
+};
 
 /// A class that dispatches messages to and from the host.
-class Dispatcher {
+class MainDispatcher {
+  int _isolates = 0;
+
   /// The channel of encoded protocol buffers, connected to the host.
   final StreamChannel<Uint8List> _channel;
 
@@ -23,11 +38,11 @@ class Dispatcher {
   /// The completers are located at indexes in this list matching the request
   /// IDs. `null` elements indicate IDs whose requests have been responded to,
   /// and which are therefore free to re-use.
-  final _outstandingRequests = <Completer<GeneratedMessage>?>[];
+  final _outstandingRequests = <_OutstandingRequest?>[];
 
   /// Creates a [Dispatcher] that sends and receives encoded protocol buffers
   /// over [channel].
-  Dispatcher(this._channel);
+  MainDispatcher(this._channel);
 
   /// Listens for incoming `CompileRequests` and passes them to [callback].
   ///
@@ -39,14 +54,8 @@ class Dispatcher {
   /// This may only be called once.
   void listen(
       FutureOr<OutboundMessage_CompileResponse> callback(
-          InboundMessage_CompileRequest request)) {
+          Dispatcher dispatcher, InboundMessage_CompileRequest request)) {
     _channel.stream.listen((binaryMessage) async {
-      // Wait a single microtask tick so that we're running in a separate
-      // microtask from the initial request dispatch. Otherwise, [waitFor] will
-      // deadlock the event loop fiber that would otherwise be checking stdin
-      // for new input.
-      await Future<void>.value();
-
       InboundMessage? message;
       try {
         try {
@@ -64,30 +73,65 @@ class Dispatcher {
             break;
 
           case InboundMessage_Message.compileRequest:
-            var request = message.compileRequest;
-            var response = await callback(request);
-            response.id = request.id;
-            _send(OutboundMessage()..compileResponse = response);
+            await _incrementConcurrency();
+
+            final responseMailbox = Mailbox();
+
+            final requestPort = ReceivePort();
+            requestPort.listen((request) async {
+              final bytes = request as Uint8List;
+              final message = OutboundMessage.fromBuffer(bytes);
+
+              switch (message.whichMessage()) {
+                case OutboundMessage_Message.error:
+                case OutboundMessage_Message.logEvent:
+                  _channel.sink.add(bytes);
+                  return;
+
+                case OutboundMessage_Message.canonicalizeRequest:
+                case OutboundMessage_Message.importRequest:
+                case OutboundMessage_Message.fileImportRequest:
+                case OutboundMessage_Message.functionCallRequest:
+                  final response = await _sendRequest(
+                      message, _responseTypeFor[message.whichMessage()]!);
+                  responseMailbox.send(response);
+                  break;
+
+                default:
+                  break;
+              }
+            });
+
+            _channel.sink.add(await _runCompilationInNewIsolate(
+                callback,
+                binaryMessage,
+                responseMailbox.rawAddress,
+                requestPort.sendPort));
+            _decrementConcurrency();
             break;
 
           case InboundMessage_Message.canonicalizeResponse:
             var response = message.canonicalizeResponse;
-            _dispatchResponse(response.id, response);
+            _dispatchResponse(response.id,
+                InboundMessage_Message.canonicalizeResponse, binaryMessage);
             break;
 
           case InboundMessage_Message.importResponse:
             var response = message.importResponse;
-            _dispatchResponse(response.id, response);
+            _dispatchResponse(response.id,
+                InboundMessage_Message.importResponse, binaryMessage);
             break;
 
           case InboundMessage_Message.fileImportResponse:
             var response = message.fileImportResponse;
-            _dispatchResponse(response.id, response);
+            _dispatchResponse(response.id,
+                InboundMessage_Message.fileImportResponse, binaryMessage);
             break;
 
           case InboundMessage_Message.functionCallResponse:
             var response = message.functionCallResponse;
-            _dispatchResponse(response.id, response);
+            _dispatchResponse(response.id,
+                InboundMessage_Message.functionCallResponse, binaryMessage);
             break;
 
           case InboundMessage_Message.notSet:
@@ -126,35 +170,15 @@ class Dispatcher {
   void sendError(ProtocolError error) =>
       _send(OutboundMessage()..error = error);
 
-  Future<InboundMessage_CanonicalizeResponse> sendCanonicalizeRequest(
-          OutboundMessage_CanonicalizeRequest request) =>
-      _sendRequest<InboundMessage_CanonicalizeResponse>(
-          OutboundMessage()..canonicalizeRequest = request);
-
-  Future<InboundMessage_ImportResponse> sendImportRequest(
-          OutboundMessage_ImportRequest request) =>
-      _sendRequest<InboundMessage_ImportResponse>(
-          OutboundMessage()..importRequest = request);
-
-  Future<InboundMessage_FileImportResponse> sendFileImportRequest(
-          OutboundMessage_FileImportRequest request) =>
-      _sendRequest<InboundMessage_FileImportResponse>(
-          OutboundMessage()..fileImportRequest = request);
-
-  Future<InboundMessage_FunctionCallResponse> sendFunctionCallRequest(
-          OutboundMessage_FunctionCallRequest request) =>
-      _sendRequest<InboundMessage_FunctionCallResponse>(
-          OutboundMessage()..functionCallRequest = request);
-
   /// Sends [request] to the host and returns the message sent in response.
-  Future<T> _sendRequest<T extends GeneratedMessage>(
-      OutboundMessage request) async {
+  Future<Uint8List> _sendRequest(
+      OutboundMessage request, InboundMessage_Message expectedResponse) {
     var id = _nextRequestId();
     _setOutboundId(request, id);
     _send(request);
 
-    var completer = Completer<T>();
-    _outstandingRequests[id] = completer;
+    var completer = Completer<Uint8List>();
+    _outstandingRequests[id] = _OutstandingRequest(completer, expectedResponse);
     return completer.future;
   }
 
@@ -174,22 +198,23 @@ class Dispatcher {
   ///
   /// Throws an error if there's no outstanding request with the given [id] or
   /// if that request is expecting a different type of response.
-  void _dispatchResponse<T extends GeneratedMessage>(int id, T response) {
-    Completer<GeneratedMessage>? completer;
+  void _dispatchResponse(
+      int id, InboundMessage_Message responseType, Uint8List binaryMessage) {
+    _OutstandingRequest? request;
     if (id < _outstandingRequests.length) {
-      completer = _outstandingRequests[id];
+      request = _outstandingRequests[id];
       _outstandingRequests[id] = null;
     }
 
-    if (completer == null) {
+    if (request == null) {
       throw paramsError(
           "Response ID $id doesn't match any outstanding requests.");
-    } else if (completer is! Completer<T>) {
+    } else if (responseType != request.expected) {
       throw paramsError("Request ID $id doesn't match response type "
-          "${response.runtimeType}.");
+          "$responseType.");
     }
 
-    completer.complete(response);
+    request.completer.complete(binaryMessage);
   }
 
   /// Sends [message] to the host.
@@ -250,4 +275,123 @@ class Dispatcher {
           const String.fromEnvironment("implementation-version")
       ..implementationName = "Dart Sass";
   }
+
+  Future<Uint8List> _runCompilationInNewIsolate(
+      FutureOr<OutboundMessage_CompileResponse> Function(
+              Dispatcher dispatcher, InboundMessage_CompileRequest request)
+          callback,
+      Uint8List binaryMessage,
+      int mailboxAddr,
+      SendPort sendPort) {
+    return Isolate.run<Uint8List>(() async {
+      var dispatcher = Dispatcher(mailboxAddr, sendPort);
+      var request = InboundMessage.fromBuffer(binaryMessage).compileRequest;
+      var response = await callback(dispatcher, request);
+      response.id = request.id;
+      return (OutboundMessage()..compileResponse = response).writeToBuffer();
+    });
+  }
+
+  // Prevent too many concurrent compilations which might cause us to get
+  // stuck due to limits on the number of concurrently executing isolates
+  // within the isolate group.
+  final List<Completer<void>> _pending = [];
+
+  Future<void> _incrementConcurrency() async {
+    if (_isolates > 10) {
+      final completer = Completer<void>();
+      _pending.add(completer);
+      await completer.future;
+    }
+    _isolates++;
+  }
+
+  void _decrementConcurrency() {
+    _isolates--;
+    if (_pending.isNotEmpty) {
+      _pending.removeLast().complete();
+    }
+  }
+}
+
+class Dispatcher {
+  final Mailbox responseMailbox;
+  final SendPort requestPort;
+
+  Dispatcher(int mailboxAddr, this.requestPort)
+      : responseMailbox = Mailbox.fromAddress(mailboxAddr);
+
+  InboundMessage_CanonicalizeResponse sendCanonicalizeRequest(
+          OutboundMessage_CanonicalizeRequest request) =>
+      _sendRequest<InboundMessage_CanonicalizeResponse>(
+          OutboundMessage()..canonicalizeRequest = request);
+
+  InboundMessage_ImportResponse sendImportRequest(
+          OutboundMessage_ImportRequest request) =>
+      _sendRequest<InboundMessage_ImportResponse>(
+          OutboundMessage()..importRequest = request);
+
+  InboundMessage_FileImportResponse sendFileImportRequest(
+          OutboundMessage_FileImportRequest request) =>
+      _sendRequest<InboundMessage_FileImportResponse>(
+          OutboundMessage()..fileImportRequest = request);
+
+  InboundMessage_FunctionCallResponse sendFunctionCallRequest(
+          OutboundMessage_FunctionCallRequest request) =>
+      _sendRequest<InboundMessage_FunctionCallResponse>(
+          OutboundMessage()..functionCallRequest = request);
+
+  void sendError(ProtocolError error) =>
+      _send(OutboundMessage()..error = error);
+
+  void sendLog(OutboundMessage_LogEvent event) =>
+      _send(OutboundMessage()..logEvent = event);
+
+  void _send(OutboundMessage message) {
+    requestPort.send(message.writeToBuffer());
+  }
+
+  /// Sends [request] to the host and returns the message sent in response.
+  T _sendRequest<T extends GeneratedMessage>(OutboundMessage request) {
+    _send(request);
+    return unwrap(InboundMessage.fromBuffer(responseMailbox.receive()));
+  }
+
+  T unwrap<T extends GeneratedMessage>(InboundMessage message) {
+    GeneratedMessage? unwrapped;
+    switch (message.whichMessage()) {
+      case InboundMessage_Message.canonicalizeResponse:
+        unwrapped = message.canonicalizeResponse;
+        break;
+
+      case InboundMessage_Message.importResponse:
+        unwrapped = message.importResponse;
+        break;
+
+      case InboundMessage_Message.fileImportResponse:
+        unwrapped = message.fileImportResponse;
+        break;
+
+      case InboundMessage_Message.functionCallResponse:
+        unwrapped = message.functionCallResponse;
+        break;
+
+      default:
+        break;
+    }
+
+    if (unwrapped is! T) {
+      throw paramsError("Request doesn't match response type "
+          "${unwrapped.runtimeType}.");
+    }
+
+    return unwrapped;
+  }
+}
+
+class _OutstandingRequest {
+  final Completer<Uint8List> completer;
+  final InboundMessage_Message expected;
+
+  _OutstandingRequest(this.completer, this.expected);
 }
