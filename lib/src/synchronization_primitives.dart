@@ -258,7 +258,7 @@ class WindowsConditionVariable implements ConditionVariable {
   void wait(covariant WindowsMutex mutex) {
     const infinite = 0xFFFFFFFF;
     const exclusive = 0;
-    if (SleepConditionVariableSRW(_impl, mutex._impl, infinite, exclusive) !=
+    if (SleepConditionVariableSRW(_impl, mutex._impl, infinite, exclusive) ==
         0) {
       throw StateError('failed to wait on a condition variable');
     }
