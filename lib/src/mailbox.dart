@@ -6,56 +6,7 @@ import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'package:ffi/ffi.dart';
-
-//
-// POSIX threading primitives
-//
-
-/// Represents `pthread_mutex_t`
-final class PthreadMutex extends Opaque {}
-
-/// Represents `pthread_cond_t`
-final class PthreadCond extends Opaque {}
-
-@Native<Int Function(Pointer<PthreadMutex>, Pointer<Void>)>()
-external int pthread_mutex_init(
-    Pointer<PthreadMutex> mutex, Pointer<Void> attrs);
-
-@Native<Int Function(Pointer<PthreadMutex>)>()
-external int pthread_mutex_lock(Pointer<PthreadMutex> mutex);
-
-@Native<Int Function(Pointer<PthreadMutex>)>()
-external int pthread_mutex_unlock(Pointer<PthreadMutex> mutex);
-
-@Native<Int Function(Pointer<PthreadMutex>)>()
-external int pthread_mutex_destroy(Pointer<PthreadMutex> cond);
-
-@Native<Int Function(Pointer<PthreadCond>, Pointer<Void>)>()
-external int pthread_cond_init(Pointer<PthreadCond> cond, Pointer<Void> attrs);
-
-@Native<Int Function(Pointer<PthreadCond>, Pointer<PthreadMutex>)>()
-external int pthread_cond_wait(
-    Pointer<PthreadCond> cond, Pointer<PthreadMutex> mutex);
-
-@Native<Int Function(Pointer<PthreadCond>)>()
-external int pthread_cond_destroy(Pointer<PthreadCond> cond);
-
-@Native<Int Function(Pointer<PthreadCond>)>()
-external int pthread_cond_signal(Pointer<PthreadCond> cond);
-
-/// Runs [body] with [mutex] locked.
-R lock<R>(Pointer<PthreadMutex> mutex, R Function() body) {
-  check(pthread_mutex_lock(mutex));
-  try {
-    return body();
-  } finally {
-    check(pthread_mutex_unlock(mutex));
-  }
-}
-
-void check(int retval) {
-  if (retval != 0) throw 'operaton failed';
-}
+import 'package:sass_embedded/src/synchronization_primitives.dart';
 
 //
 // Single producer single consumer mailbox for synchronous communication
@@ -72,23 +23,14 @@ final class _MailboxRepr extends Struct {
   external int state;
 }
 
-extension on Pointer<_MailboxRepr> {
-  Pointer<PthreadMutex> get mutex =>
-      Pointer<PthreadMutex>.fromAddress(address + Mailbox.mutexOffs);
-  Pointer<PthreadCond> get cond =>
-      Pointer<PthreadCond>.fromAddress(address + Mailbox.condOffs);
-}
+typedef SendableMailbox = (int, int, int);
 
 /// Simple one message mailbox.
 class Mailbox {
-  static final int mutexSize = 64;
-  static final int condSize = 64;
-  static final int headerSize = sizeOf<_MailboxRepr>();
-  static final int mutexOffs = headerSize;
-  static final int condOffs = mutexOffs + mutexSize;
-  static final int totalSize = condOffs + condSize;
-
   final Pointer<_MailboxRepr> _mailbox;
+  final Mutex mutex;
+  final ConditionVariable condVar;
+
   bool isRunning = true;
 
   static const stateEmpty = 0;
@@ -96,19 +38,24 @@ class Mailbox {
 
   static final finalizer = Finalizer((Pointer<_MailboxRepr> mailbox) {
     calloc.free(mailbox.ref.buffer);
-    pthread_mutex_destroy(mailbox.mutex);
-    pthread_cond_destroy(mailbox.cond);
     calloc.free(mailbox);
   });
 
-  Mailbox() : _mailbox = calloc.allocate(Mailbox.totalSize) {
-    check(pthread_mutex_init(_mailbox.mutex, nullptr));
-    check(pthread_cond_init(_mailbox.cond, nullptr));
+  Mailbox()
+      : _mailbox = calloc.allocate(sizeOf<_MailboxRepr>()),
+        mutex = Mutex(),
+        condVar = ConditionVariable() {
     finalizer.attach(this, _mailbox);
   }
 
   /// Create a mailbox pointing to an already existing mailbox.
-  Mailbox.fromAddress(int address) : _mailbox = Pointer.fromAddress(address);
+  Mailbox.fromAddresses(SendableMailbox addresses)
+      : _mailbox = Pointer.fromAddress(addresses.$1),
+        mutex = Mutex.fromAddress(addresses.$2),
+        condVar = ConditionVariable.fromAddress(addresses.$3);
+
+  SendableMailbox toAddresses() =>
+      (_mailbox.address, mutex.rawAddress, condVar.rawAddress);
 
   void send(Uint8List? message) {
     if (_mailbox.ref.state != stateEmpty) {
@@ -116,7 +63,8 @@ class Mailbox {
     }
 
     final buffer = message != null ? _toBuffer(message) : nullptr;
-    lock(_mailbox.mutex, () {
+
+    mutex.holdingLock(() {
       if (_mailbox.ref.state != stateEmpty) {
         throw 'Invalid state: ${_mailbox.ref.state}';
       }
@@ -124,16 +72,17 @@ class Mailbox {
       _mailbox.ref.state = stateFull;
       _mailbox.ref.buffer = buffer;
       _mailbox.ref.bufferLength = message?.length ?? 0;
-      pthread_cond_signal(_mailbox.cond);
+
+      condVar.notify();
     });
   }
 
   static final _emptyResponse = Uint8List(0);
 
-  Uint8List receive() => lock(_mailbox.mutex, () {
+  Uint8List receive() => mutex.holdingLock(() {
         // Wait for request to arrive.
         while (_mailbox.ref.state != stateFull) {
-          pthread_cond_wait(_mailbox.cond, _mailbox.mutex);
+          condVar.wait(mutex);
         }
 
         final result = _toList(

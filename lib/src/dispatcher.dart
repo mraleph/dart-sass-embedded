@@ -105,7 +105,7 @@ class MainDispatcher {
             _channel.sink.add(await _runCompilationInNewIsolate(
                 callback,
                 binaryMessage,
-                responseMailbox.rawAddress,
+                responseMailbox.toAddresses(),
                 requestPort.sendPort));
             _decrementConcurrency();
             break;
@@ -281,10 +281,10 @@ class MainDispatcher {
               Dispatcher dispatcher, InboundMessage_CompileRequest request)
           callback,
       Uint8List binaryMessage,
-      int mailboxAddr,
+      SendableMailbox mailbox,
       SendPort sendPort) {
     return Isolate.run<Uint8List>(() async {
-      var dispatcher = Dispatcher(mailboxAddr, sendPort);
+      var dispatcher = Dispatcher(mailbox, sendPort);
       var request = InboundMessage.fromBuffer(binaryMessage).compileRequest;
       var response = await callback(dispatcher, request);
       response.id = request.id;
@@ -318,8 +318,8 @@ class Dispatcher {
   final Mailbox responseMailbox;
   final SendPort requestPort;
 
-  Dispatcher(int mailboxAddr, this.requestPort)
-      : responseMailbox = Mailbox.fromAddress(mailboxAddr);
+  Dispatcher(SendableMailbox mailbox, this.requestPort)
+      : responseMailbox = Mailbox.fromAddresses(mailbox);
 
   InboundMessage_CanonicalizeResponse sendCanonicalizeRequest(
           OutboundMessage_CanonicalizeRequest request) =>
